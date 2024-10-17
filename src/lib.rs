@@ -158,6 +158,7 @@ impl<T, const N: usize> RawSmallVec<T, N> {
             inline: ManuallyDrop::new(inline),
         }
     }
+    #[flux_rs::trusted]
     #[inline]
     const fn new_heap(ptr: NonNull<T>, capacity: usize) -> Self {
         Self {

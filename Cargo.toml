@@ -20,6 +20,8 @@ extract_if = []
 
 [dependencies]
 serde = { version = "1", optional = true, default-features = false }
+# flux-rs = { git = "https://github.com/flux-rs/flux" }
+flux-rs = { path = "../flux/lib/flux-rs" } 
 
 [dev-dependencies]
 bincode = "1.0.1"
@@ -27,3 +29,6 @@ bincode = "1.0.1"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.flux]
+enabled = true
