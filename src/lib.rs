@@ -100,6 +100,18 @@ use serde::{
 #[cfg(feature = "std")]
 use std::io;
 
+#[flux_rs::sig(fn(bool[true]))]
+pub fn flux_assert(_cond: bool) {}
+
+#[flux_rs::sig(fn(b:bool) ensures b)]
+pub fn flux_assume(cond: bool) {
+    if cond {
+        return;
+    } else {
+        flux_assume(cond)
+    }
+}
+
 /// Error type for APIs with fallible heap allocation
 #[derive(Debug)]
 pub enum CollectionAllocErr {
@@ -144,6 +156,8 @@ fn infallible<T>(result: Result<T, CollectionAllocErr>) -> T {
 
 impl<T, const N: usize> RawSmallVec<T, N> {
     #[inline]
+    #[flux_rs::trusted]
+    #[flux_rs::sig(fn() -> bool[true])]
     const fn is_zst() -> bool {
         size_of::<T>() == 0
     }
@@ -259,44 +273,56 @@ impl<T, const N: usize> RawSmallVec<T, N> {
 /// the length in the `usize::BITS - 1` most significant bits.
 ///
 /// For a ZST, we never use the heap, so we just store the length directly.
+#[flux_rs::refined_by(len:int)]
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-struct TaggedLen(usize);
+struct TaggedLen {
+    #[flux::field(usize[len])]
+    len: usize,
+}
 
 impl TaggedLen {
     #[inline]
+    #[flux_rs::sig(fn (len:usize, on_heap: _, is_zst: bool[true]) -> Self[len])]
     pub const fn new(len: usize, on_heap: bool, is_zst: bool) -> Self {
         if is_zst {
             debug_assert!(!on_heap);
-            TaggedLen(len)
+            TaggedLen { len }
         } else {
             debug_assert!(len < isize::MAX as usize);
-            TaggedLen((len << 1) | on_heap as usize)
+            TaggedLen {
+                len: (len << 1) | on_heap as usize,
+            }
         }
     }
 
     #[inline]
     #[must_use]
+    #[flux_rs::sig(fn(_, bool[true]) -> bool[false])]
     pub const fn on_heap(self, is_zst: bool) -> bool {
         if is_zst {
             false
         } else {
-            (self.0 & 1_usize) == 1
+            (self.len & 1_usize) == 1
         }
     }
 
     #[inline]
+    #[flux_rs::sig(fn (self: TaggedLen[@n], is_zst: bool[true]) -> usize[n])]
     pub const fn value(self, is_zst: bool) -> usize {
         if is_zst {
-            self.0
+            self.len
         } else {
-            self.0 >> 1
+            self.len >> 1
         }
     }
 }
 
 #[repr(C)]
+#[flux_rs::refined_by(len:int)]
+#[flux_rs::invariant(len <= usize::MAX)]
 pub struct SmallVec<T, const N: usize> {
+    #[flux_rs::field(TaggedLen[len])]
     len: TaggedLen,
     raw: RawSmallVec<T, N>,
     _marker: PhantomData<T>,
@@ -489,6 +515,7 @@ where
 /// Returned from [`SmallVec::into_iter`][1].
 ///
 /// [1]: struct.SmallVec.html#method.into_iter
+#[flux_rs::refined_by(begin:int)]
 pub struct IntoIter<T, const N: usize> {
     // # Safety
     //
@@ -496,13 +523,17 @@ pub struct IntoIter<T, const N: usize> {
     //
     // The members from begin..end are initialized
     raw: RawSmallVec<T, N>,
+    #[flux_rs::field(usize[begin])]
     begin: usize,
+    #[flux_rs::field(TaggedLen{v: begin <= v})]
     end: TaggedLen,
     _marker: PhantomData<T>,
 }
 
 impl<T, const N: usize> IntoIter<T, N> {
     #[inline]
+    #[flux_rs::trusted]
+    #[flux_rs::sig(fn() -> bool[true])]
     const fn is_zst() -> bool {
         size_of::<T>() == 0
     }
@@ -559,15 +590,19 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
     type Item = T;
 
     #[inline]
+    // #[flux_rs::sig(fn(self: &strg IntoIter<T,_>) -> Option<T> ensures self: IntoIter<T,_>)]
+    #[flux_rs::trusted]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.begin == self.end.value(Self::is_zst()) {
+        let begin = self.begin;
+        let end = self.end.value(Self::is_zst());
+        if begin == end {
             None
         } else {
             // SAFETY: see above
             unsafe {
                 let ptr = self.as_mut_ptr();
                 let value = ptr.add(self.begin).read();
-                self.begin += 1;
+                self.begin = begin + 1;
                 Some(value)
             }
         }
@@ -582,6 +617,7 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
 
 impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
     #[inline]
+    #[flux_rs::trusted]
     fn next_back(&mut self) -> Option<Self::Item> {
         let mut end = self.end.value(Self::is_zst());
         if self.begin == end {
@@ -604,6 +640,8 @@ impl<T, const N: usize> core::iter::FusedIterator for IntoIter<T, N> {}
 
 impl<T, const N: usize> SmallVec<T, N> {
     #[inline]
+    #[flux_rs::trusted]
+    #[flux_rs::sig(fn() -> bool[true])]
     const fn is_zst() -> bool {
         size_of::<T>() == 0
     }
@@ -734,6 +772,7 @@ impl<T, const N: usize> SmallVec<T, N> {
     ///
     /// The active union member must be the self.raw.heap
     #[inline]
+    #[flux_rs::sig(fn(self: &strg Self) ensures self: Self)]
     unsafe fn set_on_heap(&mut self) {
         self.len = TaggedLen::new(self.len(), true, Self::is_zst());
     }
@@ -744,6 +783,7 @@ impl<T, const N: usize> SmallVec<T, N> {
     ///
     /// The active union member must be the self.raw.inline
     #[inline]
+    #[flux_rs::sig(fn(self: &strg Self) ensures self: Self)]
     unsafe fn set_inline(&mut self) {
         self.len = TaggedLen::new(self.len(), false, Self::is_zst());
     }
@@ -758,6 +798,7 @@ impl<T, const N: usize> SmallVec<T, N> {
     /// `new_len <= self.capacity()` must be true, and all the elements in the range `..self.len`
     /// must be initialized.
     #[inline]
+    #[flux_rs::sig(fn(self: &strg Self, new_len: usize) ensures self: Self[new_len])]
     pub unsafe fn set_len(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.capacity());
         let on_heap = self.len.on_heap(Self::is_zst());
@@ -765,6 +806,7 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     #[inline]
+    #[flux_rs::sig(fn() -> usize[usize::MAX])]
     pub const fn inline_size() -> usize {
         if Self::is_zst() {
             usize::MAX
@@ -774,17 +816,20 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     #[inline]
+    #[flux_rs::sig(fn(&Self[@n]) -> usize[n])]
     pub const fn len(&self) -> usize {
         self.len.value(Self::is_zst())
     }
 
     #[must_use]
     #[inline]
+    #[flux_rs::sig(fn(&Self[@n]) -> bool[n<=0])]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     #[inline]
+    #[flux_rs::sig(fn(&Self[@n]) -> usize{v:n <= v})]
     pub const fn capacity(&self) -> usize {
         if self.len.on_heap(Self::is_zst()) {
             // SAFETY: raw.heap is active
@@ -966,11 +1011,14 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     #[inline]
+    #[flux_rs::sig(fn (self: &strg Self, value: T) ensures self: Self)]
     unsafe fn push_heap(&mut self, value: T) {
         // SAFETY: see above
         debug_assert!(self.spilled());
         let len = self.len();
+        // unfold
         let cap = self.raw.heap.1;
+        // fold
         if len == cap {
             self.reserve(1);
         }
@@ -980,6 +1028,7 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     #[inline]
+    #[flux_rs::sig(fn (self: &strg Self) -> Option<T> ensures self: Self)]
     pub fn pop(&mut self) -> Option<T> {
         if self.is_empty() {
             None
@@ -1014,8 +1063,10 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     #[inline]
+    #[flux_rs::trusted]
+    #[flux_rs::sig(fn (self: &mut Self[@n], _))] // FLUX-BUG
     pub fn grow(&mut self, new_capacity: usize) {
-        infallible(self.try_grow(new_capacity));
+        infallible(self.try_grow(new_capacity)); // FLUX-BUG
     }
 
     #[cold]
@@ -1060,9 +1111,10 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     #[inline]
+    #[flux_rs::sig(fn(self: &strg Self[@n], additional: usize) ensures self: Self[n])]
     pub fn reserve(&mut self, additional: usize) {
         // can't overflow since len <= capacity
-        if additional > self.capacity() - self.len() {
+        if additional > self.gap() {
             let new_capacity = infallible(
                 self.len()
                     .checked_add(additional)
@@ -1074,8 +1126,12 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     #[inline]
+    #[flux_rs::sig(fn(self: &strg Self, additional: usize) -> _ ensures self: Self)]
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), CollectionAllocErr> {
-        if additional > self.capacity() - self.len() {
+        let len = self.len();
+        let cap = self.capacity();
+        flux_assert(cap >= len);
+        if additional > cap - len {
             let new_capacity = self
                 .len()
                 .checked_add(additional)
@@ -1088,9 +1144,14 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     #[inline]
+    fn gap(&self) -> usize {
+        self.capacity() - self.len()
+    }
+
+    #[inline]
     pub fn reserve_exact(&mut self, additional: usize) {
         // can't overflow since len <= capacity
-        if additional > self.capacity() - self.len() {
+        if additional > self.gap() {
             let new_capacity = infallible(
                 self.len()
                     .checked_add(additional)
@@ -1102,7 +1163,7 @@ impl<T, const N: usize> SmallVec<T, N> {
 
     #[inline]
     pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), CollectionAllocErr> {
-        if additional > self.capacity() - self.len() {
+        if additional > self.gap() {
             let new_capacity = self
                 .len()
                 .checked_add(additional)
@@ -1239,7 +1300,8 @@ impl<T, const N: usize> SmallVec<T, N> {
 
     fn insert_many_impl<I: Iterator<Item = T>>(&mut self, mut index: usize, iter: I) {
         let len = self.len();
-        if index == len {
+        if index >= len {
+            // FLUX-BUG??? shouldn't this be index >= len (instead of index == len)?
             return self.extend(iter);
         }
 
@@ -1501,6 +1563,7 @@ impl<T, const N: usize> SmallVec<T, N> {
         }
     }
 
+    #[flux_rs::sig(fn (self: &strg Self[@n], iter: _) ensures self: Self)]
     fn extend_impl<I: Iterator<Item = T>>(&mut self, iter: I) {
         let mut iter = iter.fuse();
         let len = self.len();
@@ -1532,6 +1595,7 @@ impl<T, const N: usize> SmallVec<T, N> {
                 }
                 let len = self.len();
                 let (ptr, capacity) = self.raw.heap;
+                flux_assume(capacity >= len);
                 let ptr = ptr.as_ptr();
                 // SAFETY: ptr is valid for `capacity - len` writes
                 let count = extend_batch(ptr, capacity - len, len, &mut iter);
@@ -1675,6 +1739,7 @@ impl<T> Drop for DropGuard<T> {
 //
 // `ptr..ptr + lower_bound` must be valid for writes
 #[inline]
+#[flux_rs::sig(fn (ptr: _, index: usize, lower_bound: usize, len: usize{index <= len}, iter: &mut I) -> usize)]
 unsafe fn insert_many_batch<T, I: Iterator<Item = T>>(
     ptr: *mut T,
     index: usize,
@@ -1803,14 +1868,15 @@ impl<T, const N: usize> Drop for SmallVec<T, N> {
 }
 
 impl<T, const N: usize> Drop for IntoIter<T, N> {
+    #[flux_rs::sig(fn (self: &strg Self) ensures self: Self)]
     fn drop(&mut self) {
         // SAFETY: see above
         unsafe {
-            let is_zst = size_of::<T>() == 0;
+            let is_zst = Self::is_zst();
             let on_heap = self.end.on_heap(is_zst);
             let begin = self.begin;
             let end = self.end.value(is_zst);
-            let ptr = self.as_mut_ptr();
+            let ptr = self.as_mut_ptr(); // FLUX-BUG
             let _drop_dealloc = if on_heap {
                 let capacity = self.raw.heap.1;
                 Some(DropDealloc {
