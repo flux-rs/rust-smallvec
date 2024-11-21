@@ -1175,6 +1175,7 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     #[inline]
+    #[flux_rs::sig(fn(self: &strg Self) ensures self: Self)] // FLUX-BUG
     pub fn shrink_to_fit(&mut self) {
         if !self.spilled() {
             return;
